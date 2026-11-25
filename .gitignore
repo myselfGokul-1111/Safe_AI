@@ -1,0 +1,5 @@
+﻿*.pth
+*.zip
+.dart_tool/
+build/
+.gradle/
