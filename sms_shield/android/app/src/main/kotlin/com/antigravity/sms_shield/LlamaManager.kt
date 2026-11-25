@@ -36,8 +36,31 @@ class LlamaManager private constructor(private val appContext: Context) {
         private const val TAG = "LlamaManager"
         const val MODEL_FILENAME = "llama1b_q4.pte"
         const val TOKENIZER_FILENAME = "tokenizer.model"
-        private const val DEFAULT_MAX_NEW_TOKENS = 35
+        // Must match the max_seq_len / max_context_len used when the .pte was exported (512).
+        const val MODEL_CONTEXT_TOKENS = 512
+        // Prompt tokens + new tokens must fit inside MODEL_CONTEXT_TOKENS.
+        private const val DEFAULT_MAX_NEW_TOKENS = 96
         private const val DEFAULT_TEMPERATURE = 0.1f
+        // Max SMS characters placed in the prompt (keeps the prompt well under the context limit).
+        private const val MAX_SMS_CHARS = 300
+
+        /**
+         * Builds a Llama 3.x Instruct chat prompt that asks for a short plain-language explanation.
+         * [verdict] is the classifier's decision (e.g. "SCAM" or "SAFE"); the model only explains it.
+         */
+        fun buildExplanationPrompt(smsText: String, verdict: String): String {
+            val sms = smsText.trim().replace(Regex("\\s+"), " ").take(MAX_SMS_CHARS)
+            return "<|begin_of_text|>" +
+                "<|start_header_id|>system<|end_header_id|>\n\n" +
+                "You explain SMS scam checks to ordinary phone users. " +
+                "The verdict is already decided; never change it. " +
+                "Reply in 2 short sentences of plain English, naming the specific warning signs in the message." +
+                "<|eot_id|>" +
+                "<|start_header_id|>user<|end_header_id|>\n\n" +
+                "Verdict: $verdict\nSMS: \"$sms\"\n\nExplain why this verdict was given." +
+                "<|eot_id|>" +
+                "<|start_header_id|>assistant<|end_header_id|>\n\n"
+        }
 
         @Volatile
         private var instance: LlamaManager? = null
@@ -360,6 +383,21 @@ class LlamaManager private constructor(private val appContext: Context) {
         temperature: Float = DEFAULT_TEMPERATURE,
         callback: GenerationCallback
     ) {
+        // Conservative token estimate (2 chars/token) so non-Latin scripts don't overflow the context.
+        val estimatedPromptTokens = prompt.length / 2
+        if (estimatedPromptTokens + maxNewTokens > MODEL_CONTEXT_TOKENS) {
+            val err = "Prompt too long for $MODEL_CONTEXT_TOKENS-token context (est. $estimatedPromptTokens + $maxNewTokens)."
+            Log.w(TAG, err)
+            mainHandler.post {
+                try {
+                    callback.onError(err)
+                } catch (t: Throwable) {
+                    Log.e(TAG, "Uncaught exception in GenerationCallback.onError", t)
+                }
+            }
+            return
+        }
+
         lifecycleLock.withLock {
             if (currentState != State.READY || llmModule == null || isClosing) {
                 val err = when {
@@ -415,7 +453,7 @@ class LlamaManager private constructor(private val appContext: Context) {
                         }
                     })
 
-                    // Reset KV-cache context to ensure subsequent generation starts cleanly within 128 context budget
+                    // Reset KV-cache context to ensure subsequent generation starts cleanly within the 512-token context budget
                     try {
                         module.resetContext()
                     } catch (e: Exception) {
@@ -441,9 +479,15 @@ class LlamaManager private constructor(private val appContext: Context) {
                         }
                         mainHandler.post {
                             try {
-                                callback.onSuccess(finalResponse)
+                                if (finalResponse.isEmpty()) {
+                                    // Blank output is a failure, so the caller falls back to the template.
+                                    Log.w(TAG, "Model returned an empty response.")
+                                    callback.onError("Model returned an empty response.")
+                                } else {
+                                    callback.onSuccess(finalResponse)
+                                }
                             } catch (t: Throwable) {
-                                Log.e(TAG, "Uncaught exception in GenerationCallback.onSuccess", t)
+                                Log.e(TAG, "Uncaught exception in GenerationCallback result dispatch", t)
                             }
                         }
                     }

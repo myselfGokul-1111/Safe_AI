@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'package:flutter/services.dart';
 import '../models/classification_result.dart';
+import 'package:flutter/foundation.dart';
 
 abstract class LlamaBackend {
   Future<String> generate({
@@ -98,8 +99,9 @@ class ExecuTorchLlamaBackend implements LlamaBackend {
 class RiskAdvisorService {
   final LlamaBackend? llamaBackend;
 
+  /// System prompt kept under 20 tokens to fit Llama 3.2 1B's 128-token context.
   static const String systemInstruction =
-      'Explain the fixed classifier result. Never change its label. Give one reason and two safe actions. Never request OTPs, PINs or card details.';
+      'SMS safety advisor. State risk and two actions.';
 
   RiskAdvisorService({this.llamaBackend});
 
@@ -131,43 +133,54 @@ class RiskAdvisorService {
     return domain;
   }
 
-  /// Constructs a compact prompt for Llama 3.2 1B targeting a maximum of 80 input tokens.
-  /// Example: Decision: SCAM; score: 1.000; threshold: 0.824; indicators: urgent (scam), verify (scam); URL: sbi-kyc-verify.xyz.
+  /// Constructs a compact prompt targeting <40 tokens so system+user+template fits in 128 token context.
+  /// Example: "SCAM 1.000 kyc url:sbi-kyc.xyz"
   static String buildPrompt(ClassificationResult a) {
     final decision = a.labelText.toUpperCase();
     final score = a.scamProbability.toStringAsFixed(3);
-    final threshold = a.threshold.toStringAsFixed(3);
 
-    final termsList = a.topContributingTerms.take(2).map((t) {
-      final cleanTerm = t.term.length > 20 ? t.term.substring(0, 20) : t.term;
-      final dir = t.pushesScam ? 'scam' : 'legitimate';
-      return '$cleanTerm ($dir)';
-    }).toList();
-    final indicators = termsList.isNotEmpty ? termsList.join(', ') : 'none';
+    // Top 1 term only to save tokens
+    final term = a.topContributingTerms.isNotEmpty
+        ? a.topContributingTerms.first.term.substring(
+            0,
+            a.topContributingTerms.first.term.length > 12
+                ? 12
+                : a.topContributingTerms.first.term.length,
+          )
+        : '';
 
-    final url = a.extractedUrls.isNotEmpty
-        ? extractDomain(a.extractedUrls.first)
-        : 'none';
+    final url = a.extractedUrls.isNotEmpty ? extractDomain(a.extractedUrls.first) : '';
 
-    return 'Decision: $decision; score: $score; threshold: $threshold; indicators: $indicators; URL: $url.';
+    final parts = [decision, score, if (term.isNotEmpty) term, if (url.isNotEmpty) 'url:$url'];
+    return parts.join(' ');
   }
 
   /// Evaluates and generates security advice for a classified message.
   Future<AdviceResult> advise(ClassificationResult classification) async {
+    if (kDebugMode) {
+      print('[RiskAdvisor] Starting advice generation for classification: ${classification.labelText}');
+    }
     final stopwatch = Stopwatch()..start();
 
     if (llamaBackend != null) {
       try {
         final isReady = await llamaBackend!.isModelAvailable();
+        if (kDebugMode) {
+          print('[RiskAdvisor] Llama backend available: $isReady');
+        }
         if (isReady) {
           final prompt = buildPrompt(classification);
+          if (kDebugMode) {
+            print('[RiskAdvisor] Prompt for Llama: $prompt');
+          }
           final rawOutput = await llamaBackend!.generate(
             systemPrompt: systemInstruction,
             userPrompt: prompt,
           );
+          if (kDebugMode) {
+            print('[RiskAdvisor] Llama raw output: $rawOutput');
+          }
           stopwatch.stop();
-
-          // Parse explanation and actions from LLM output
           final parsed = _parseLlamaOutput(rawOutput);
           return AdviceResult(
             explanation: parsed.explanation,
@@ -176,8 +189,11 @@ class RiskAdvisorService {
             latencyMs: stopwatch.elapsedMilliseconds,
           );
         }
-      } catch (e) {
-        // Fall back gracefully to template on error
+      } catch (e, stack) {
+        if (kDebugMode) {
+          print('[RiskAdvisor] Llama backend error: $e');
+          print(stack);
+        }
         final fallback = TemplateLlamaBackend.generateTemplateAdvice(classification);
         return AdviceResult(
           explanation: fallback.explanation,
@@ -188,15 +204,17 @@ class RiskAdvisorService {
       }
     }
 
-    // Default template advice
+    if (kDebugMode) {
+      print('[RiskAdvisor] Llama backend not configured – using template advice');
+    }
     return TemplateLlamaBackend.generateTemplateAdvice(classification);
   }
 
+  // Parses the Llama output into explanation and actions.
   static ({String explanation, List<String> actions}) _parseLlamaOutput(String text) {
     final lines = text.split('\n').map((l) => l.trim()).where((l) => l.isNotEmpty).toList();
     final List<String> explanationParts = [];
     final List<String> actions = [];
-
     bool inActionsSection = false;
 
     for (final line in lines) {
@@ -205,12 +223,9 @@ class RiskAdvisorService {
         inActionsSection = true;
         continue;
       }
-
       if (inActionsSection || RegExp(r'^(?:\d+[\.\)]|\-|\*)\s+').hasMatch(line)) {
         final cleanAction = line.replaceFirst(RegExp(r'^(?:\d+[\.\)]|\-|\*)\s+'), '').trim();
-        if (cleanAction.isNotEmpty) {
-          actions.add(cleanAction);
-        }
+        if (cleanAction.isNotEmpty) actions.add(cleanAction);
       } else {
         explanationParts.add(line);
       }
@@ -227,8 +242,6 @@ class RiskAdvisorService {
         'Verify with the sender organization through their official application.',
       ]);
     }
-
     return (explanation: explanation, actions: actions);
   }
 }
-

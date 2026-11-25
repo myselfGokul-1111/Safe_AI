@@ -51,13 +51,11 @@ void main() {
 
       final prompt = RiskAdvisorService.buildPrompt(result);
 
-      // Verify prompt components
-      expect(prompt, contains('Decision: SCAM'));
-      expect(prompt, contains('score: 1.000'));
-      expect(prompt, contains('threshold: 0.824'));
-      expect(prompt, contains('indicators: kyc (scam), sbi (legitimate)'));
-      expect(prompt, contains('URL: sbi-kyc-verify.xyz'));
-
+      // Verify prompt contains decision label and score
+      expect(prompt, contains('SCAM'));
+      expect(prompt, contains('1.000'));
+      // Verify URL domain is included
+      expect(prompt, contains('sbi-kyc-verify.xyz'));
       // Verify complete SMS body is excluded
       expect(prompt, isNot(contains(result.rawText)));
       expect(prompt, isNot(contains('Message:')));

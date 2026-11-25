@@ -11,18 +11,16 @@ class MainActivity : FlutterActivity() {
     companion object {
         private const val TAG = "MainActivity"
         private const val CHANNEL = "com.antigravity.sms_shield/llama_executorch"
-        private const val MAX_GENERATION_TOKENS = 35
+        // Keep in sync with LlamaManager (512-token context: prompt + new tokens must fit).
+        private const val MAX_GENERATION_TOKENS = 96
     }
-
-    private var llamaManager: LlamaManager? = null
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
 
-        val manager = LlamaManager.getInstance(applicationContext)
-        llamaManager = manager
-
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, CHANNEL).setMethodCallHandler { call, result ->
+            // Fetch per call so a closed/reset singleton is never reused after the Activity is recreated.
+            val manager = LlamaManager.getInstance(applicationContext)
             when (call.method) {
                 "isModelReady" -> {
                     if (manager.isModelReady()) {
@@ -53,7 +51,7 @@ class MainActivity : FlutterActivity() {
                     val requestedTokens = call.argument<Int>("maxNewTokens") ?: MAX_GENERATION_TOKENS
                     val temperature = (call.argument<Double>("temperature") ?: 0.1).toFloat()
 
-                    // Constrain tokens strictly to preserve 128 context budget
+                    // Cap new tokens so prompt + output stay inside the 512-token context
                     val safeTokens = min(requestedTokens, MAX_GENERATION_TOKENS).coerceAtLeast(1)
 
                     if (!manager.areModelFilesPresent()) {
